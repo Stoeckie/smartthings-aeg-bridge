@@ -1,0 +1,7 @@
+__pycache__
+venv
+data
+*.log
+config.json
+*.bat
+*.ps1
