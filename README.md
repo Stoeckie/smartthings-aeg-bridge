@@ -47,6 +47,8 @@ Set the Windows network to **Private** and give the pc a fixed IP (DHCP reservat
 
 The bridge refreshes the tokens itself and saves them in `config.json`. Credentials only live in that file on the pc (it is in `.gitignore`).
 
+Security: the setup page only answers on the pc itself (or the networks in `STBRIDGE_SETUP_ALLOW`), only when opened by IP or `localhost`, and refuses forms posted from other websites. The LAN API (`/stbridge/...`) only answers private and local addresses.
+
 Test without appliances: `venv\Scripts\python.exe stoeckie_bridge.py --demo`.
 
 ## 1b. Bridge in Docker (instead of Windows)
