@@ -4,13 +4,14 @@
 --   dryer  (AEG via Electrolux API)  -> dryerOperatingState, remoteControlStatus, contactSensor (door)
 --   window (VELUX ACTIVE via HomeKit) -> windowShade, windowShadeLevel
 --   sensor (VELUX climate sensor)     -> temperature, humidity, CO2
+--   aircon (Fujitsu via FGLair)       -> switch, airConditionerMode, setpoint, fan, swing, indoor/outdoor temp
 local Driver = require "st.driver"
 local capabilities = require "st.capabilities"
 local log = require "log"
 local cosock = require "cosock"
 local api = require "bridge_api"
 
-local BUILD = "2026-10-29b"
+local BUILD = "2026-10-30a"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 40
 local SCAN_CONCURRENCY = 16
@@ -21,8 +22,20 @@ local windowShadeLevel = capabilities.windowShadeLevel
 local dryerOp = capabilities.dryerOperatingState
 local remoteControl = capabilities.remoteControlStatus
 local contact = capabilities.contactSensor
+local acMode = capabilities.airConditionerMode
+local acFan = capabilities.airConditionerFanMode
+local oscillation = capabilities.fanOscillationMode
+local coolSetpoint = capabilities.thermostatCoolingSetpoint
 
-local PROFILE = { dryer = "stoeckie-dryer", window = "stoeckie-window", sensor = "stoeckie-climate" }
+local PROFILE = { dryer = "stoeckie-dryer", window = "stoeckie-window", sensor = "stoeckie-climate",
+                  aircon = "stoeckie-aircon" }
+local MANUFACTURER = { dryer = "AEG", aircon = "Fujitsu" }
+
+-- bridge value <-> SmartThings value
+local AC_MODE_TO_ST = { auto = "auto", cool = "cool", dry = "dry", fan = "fanOnly", heat = "heat" }
+local AC_MODE_FROM_ST = { auto = "auto", cool = "cool", dry = "dry", fanOnly = "fan", fan = "fan", heat = "heat" }
+local SWING_TO_ST = { off = "fixed", vertical = "vertical", horizontal = "horizontal", both = "all" }
+local SWING_FROM_ST = { fixed = "off", vertical = "vertical", horizontal = "horizontal", all = "both" }
 
 local state = {}       -- parent device.id -> { poll_timer, fast_until }
 local discovered = {}  -- dni -> { ip, port, info }
@@ -111,7 +124,60 @@ local function emit_sensor(dev, s)
   end
 end
 
-local EMIT = { dryer = emit_dryer, window = emit_window, sensor = emit_sensor }
+local function map_list(list, map)
+  local out = {}
+  for _, v in ipairs(list or {}) do
+    local m = map and map[v] or v
+    if m then out[#out + 1] = m end
+  end
+  return out
+end
+
+-- supported* lists change rarely: only emit them when they differ from last time
+local function emit_list(dev, key, list, make)
+  local enc = table.concat(list, ",")
+  if dev:get_field(key) == enc then return end
+  dev:set_field(key, enc)
+  try_emit(dev, function() return make(list, { visibility = { displayed = false } }) end)
+end
+
+local function emit_aircon(dev, s)
+  try_emit(dev, function() return s.power == "off" and capabilities.switch.switch.off() or capabilities.switch.switch.on() end)
+  local m = AC_MODE_TO_ST[s.mode or ""]
+  if m then try_emit(dev, function() return acMode.airConditionerMode(m) end) end
+  emit_list(dev, "acModes", map_list(s.supportedModes, AC_MODE_TO_ST), acMode.supportedAcModes)
+  if s.setpoint then
+    try_emit(dev, function() return coolSetpoint.coolingSetpoint({ value = tonumber(s.setpoint), unit = "C" }) end)
+  end
+  local r = s.setpointRange
+  if type(r) == "table" and r[1] and r[2] then
+    local enc = r[1] .. "-" .. r[2]
+    if dev:get_field("spRange") ~= enc then
+      dev:set_field("spRange", enc)
+      try_emit(dev, function()
+        return coolSetpoint.coolingSetpointRange({ value = { minimum = r[1], maximum = r[2], step = 0.5 }, unit = "C" })
+      end)
+    end
+  end
+  if s.temperature then
+    try_emit(dev, function() return capabilities.temperatureMeasurement.temperature({ value = tonumber(s.temperature), unit = "C" }) end)
+  end
+  if s.outdoorTemperature and dev.profile.components.outdoor then
+    local t = tonumber(s.outdoorTemperature)
+    local ok, err = pcall(function()
+      dev:emit_component_event(dev.profile.components.outdoor,
+        capabilities.temperatureMeasurement.temperature({ value = t, unit = "C" }))
+    end)
+    if not ok then log.warn("[stbridge] " .. dev.label .. " outdoor: " .. tostring(err)) end
+  end
+  if s.fan then try_emit(dev, function() return acFan.fanMode(s.fan) end) end
+  emit_list(dev, "acFans", map_list(s.supportedFans), acFan.supportedAcFanModes)
+  local sw = SWING_TO_ST[s.swing or ""]
+  if sw then try_emit(dev, function() return oscillation.fanOscillationMode(sw) end) end
+  emit_list(dev, "acSwings", map_list(s.supportedSwings, SWING_TO_ST), oscillation.supportedFanOscillationModes)
+end
+
+local EMIT = { dryer = emit_dryer, window = emit_window, sensor = emit_sensor, aircon = emit_aircon }
 
 -- polling -------------------------------------------------------------------------
 
@@ -125,7 +191,7 @@ local function create_child(driver, parent, d)
     parent_assigned_child_key = d.id,
     label = d.name or d.id,
     profile = profile,
-    manufacturer = (d.type == "dryer") and "AEG" or "VELUX",
+    manufacturer = MANUFACTURER[d.type] or "VELUX",
     model = "Stoeckie Bridge " .. d.type,
     vendor_provided_label = d.name or d.id,
   })
@@ -230,6 +296,21 @@ local function handle_machine_state(driver, device, cmd)
   elseif want == "stop" then
     send(driver, device, "stop")
   end
+end
+
+local function handle_switch_on(driver, device) send(driver, device, "on") end
+local function handle_switch_off(driver, device) send(driver, device, "off") end
+local function handle_ac_mode(driver, device, cmd)
+  local m = AC_MODE_FROM_ST[cmd.args.mode or ""]
+  if m then send(driver, device, "mode", m) else log.warn("[stbridge] unsupported AC mode " .. tostring(cmd.args.mode)) end
+end
+local function handle_setpoint(driver, device, cmd)
+  send(driver, device, "setpoint", tonumber(cmd.args.setpoint))
+end
+local function handle_fan_mode(driver, device, cmd) send(driver, device, "fan", cmd.args.fanMode) end
+local function handle_oscillation(driver, device, cmd)
+  local m = SWING_FROM_ST[cmd.args.fanOscillationMode or ""]
+  if m then send(driver, device, "swing", m) end
 end
 
 -- lifecycle -----------------------------------------------------------------------
@@ -376,6 +457,22 @@ local driver = Driver("stoeckie-bridge-local", {
     },
     [dryerOp.ID] = {
       [dryerOp.commands.setMachineState.NAME] = handle_machine_state,
+    },
+    [capabilities.switch.ID] = {
+      [capabilities.switch.commands.on.NAME] = handle_switch_on,
+      [capabilities.switch.commands.off.NAME] = handle_switch_off,
+    },
+    [acMode.ID] = {
+      [acMode.commands.setAirConditionerMode.NAME] = handle_ac_mode,
+    },
+    [coolSetpoint.ID] = {
+      [coolSetpoint.commands.setCoolingSetpoint.NAME] = handle_setpoint,
+    },
+    [acFan.ID] = {
+      [acFan.commands.setFanMode.NAME] = handle_fan_mode,
+    },
+    [oscillation.ID] = {
+      [oscillation.commands.setFanOscillationMode.NAME] = handle_oscillation,
     },
   },
 })

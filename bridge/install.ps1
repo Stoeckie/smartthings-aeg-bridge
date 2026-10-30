@@ -34,7 +34,7 @@ if (-not (Test-Path "$dir\venv\Scripts\python.exe")) {
     & cmd /c "$py -m venv `"$dir\venv`""
 }
 & "$dir\venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
-& "$dir\venv\Scripts\python.exe" -m pip install --upgrade aiohttp electrolux-group-developer-sdk --quiet
+& "$dir\venv\Scripts\python.exe" -m pip install --upgrade -r "$dir\requirements.txt" --quiet
 if ($LASTEXITCODE -ne 0) { throw "pip install mislukt" }
 
 if (-not (Test-Path "$dir\config.json")) {

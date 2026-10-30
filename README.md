@@ -1,11 +1,14 @@
-# AEG / Electrolux dryer in SmartThings (bridge + Edge driver)
+# AEG / Electrolux dryer and Fujitsu FGLair air conditioners in SmartThings (bridge + Edge driver)
 
 Get an **AEG or Electrolux tumble dryer** (and washer-dryer) into SmartThings with status, remaining time, door and a "cycle finished" state you can use for notifications. Uses the **official Electrolux Group Developer API**.
 
-The Electrolux API is cloud only, and SmartThings Edge drivers can not reach the internet. So there are two parts:
+Also: **Fujitsu air conditioners with an FGLair wifi adapter** (power, mode, setpoint, fan, swing, room and outdoor temperature) through the cloud the FGLair app uses.
+
+Both are cloud only, and SmartThings Edge drivers can not reach the internet. So there are two parts:
 
 ```
 Electrolux cloud --live events--> bridge (Windows pc or Docker, port 8787) <--LAN-- Edge driver on the hub
+FGLair (Ayla) cloud --poll 60 s-->
 ```
 
 * `bridge/`: small Python service for a pc that is always on: Windows (installer) or any Docker host (Linux, NAS, Raspberry Pi)
@@ -22,13 +25,23 @@ Per dryer:
 
 Routine example: *Dryer job state = Finished → send notification*.
 
+Per air conditioner (FGLair):
+
+* `switch`: on / off
+* `airConditionerMode`: auto, cool, dry, fan only, heat (what the unit supports)
+* `thermostatCoolingSetpoint`: the target temperature in every mode (16 to 30 °C, 0.5 steps)
+* `airConditionerFanMode`: quiet, low, medium, high, auto
+* `fanOscillationMode`: fixed, vertical, horizontal, all (what the unit supports)
+* `temperatureMeasurement`: room temperature (models with a sensor) and an `outdoor` component with the outdoor temperature
+
 ## 1. Bridge (Windows pc)
 
 1. Copy the `bridge` folder to the pc, e.g. `C:\StoeckieBridge`.
 2. Double-click `install.bat`. It installs Python if needed (winget), the packages, a firewall rule for port 8787 (Windows asks for permission once) and a scheduled task that starts the bridge at logon and restarts it on failure. Then the setup page opens.
 3. Log in at **developer.electrolux.one** with your AEG / Electrolux app account (e-mail and password; if you normally log in with Google/Apple or a code, set a password first). Create an **API key** and **generate a token**.
 4. Paste API key, access token and refresh token on the setup page: `setup.bat` or http://localhost:8787/setup (only reachable on the pc itself).
-5. `check-aeg.bat` tests the login and lists your appliances. `restart.bat` restarts the bridge and writes `devices.json`. Log: `bridge.log`.
+5. FGLair: enter the e-mail and password of the FGLair app on the same setup page (region Europe for EU accounts).
+6. `check.bat` tests the logins and lists your appliances. `restart.bat` restarts the bridge and writes `devices.json`. Log: `bridge.log`.
 
 Set the Windows network to **Private** and give the pc a fixed IP (DHCP reservation), otherwise the hub can not reach the bridge.
 
@@ -45,15 +58,30 @@ docker compose up -d --build
 
 * Uses host networking, so the hub finds the bridge on the host IP, port 8787. Data (config.json with the refreshed tokens, log) lives in `bridge/data`.
 * Setup page: http://localhost:8787/setup on the Docker host. From another computer: set `STBRIDGE_SETUP_ALLOW: "192.168.x.0/24"` in `docker-compose.yml`.
-* Or pass the credentials once as `ELECTROLUX_API_KEY`, `ELECTROLUX_ACCESS_TOKEN`, `ELECTROLUX_REFRESH_TOKEN` (only read on the first start; after that the bridge keeps refreshed tokens in `data/config.json`).
+* Or pass the credentials once as `ELECTROLUX_API_KEY`, `ELECTROLUX_ACCESS_TOKEN`, `ELECTROLUX_REFRESH_TOKEN` and `FGLAIR_USERNAME`, `FGLAIR_PASSWORD`, `FGLAIR_REGION` (only read on the first start; after that `data/config.json` wins).
 * Without host networking (Docker Desktop on Windows/Mac): use `ports: ["8787:8787"]` instead of `network_mode: host`, and set `STBRIDGE_SETUP_ALLOW`.
 
 ## 2. Edge driver (hub)
 
 1. Enroll your hub in the channel: https://bestow-regional.api.smartthings.com/invite/qWjBdybRNG2y (Stoeckie Edge Drivers) and install **Stoeckie Bridge (local)**.
-2. SmartThings app: **Add device → Scan nearby**. The driver scans the hub's subnet on port 8787 and creates a "Stoeckie Bridge" device; the dryer appears at the next poll.
+2. SmartThings app: **Add device → Scan nearby**. The driver scans the hub's subnet on port 8787 and creates a "Stoeckie Bridge" device; the dryer and air conditioners appear at the next poll.
 
 Bridge LAN API (no auth, LAN only): `GET /stbridge/info`, `GET /stbridge/devices`, `POST /stbridge/devices/<id>/command` with `{"cmd": "run|pause|resume|stop|refresh"}`.
+
+## FGLair notes
+
+* FGLair has no local API and no official cloud API. The bridge uses [ayla-iot-unofficial](https://pypi.org/project/ayla-iot-unofficial/), the library the Home Assistant Fujitsu FGLair integration uses. It can stop working when Fujitsu changes the cloud.
+* Units the library does not know (for example AC-UTY wired controllers) are skipped with a line in `bridge.log` that shows the model; open an issue with that line.
+* Airstage (newer Fujitsu modules) has a local API and is not covered here.
+
+## Development
+
+```
+pip install -r bridge/requirements.txt pytest lupa
+python -m pytest bridge/tests driver/tests
+```
+
+The FGLair test runs against a fake Ayla cloud; the driver test runs `driver/src/init.lua` with a mocked SmartThings runtime against the bridge in `--demo` mode.
 
 ## Siemens / Bosch?
 
@@ -61,4 +89,4 @@ Not needed: Home Connect appliances have an official SmartThings integration (Ad
 
 ## License
 
-Apache 2.0, see LICENSE. Not affiliated with AB Electrolux, AEG or Samsung SmartThings.
+Apache 2.0, see LICENSE. Not affiliated with AB Electrolux, AEG, Fujitsu General, Ayla Networks or Samsung SmartThings.

@@ -10,5 +10,5 @@ bridge/*.log.*
 bridge/devices.json
 bridge/install-log.txt
 bridge/restart-log.txt
-bridge/check-aeg.txt
+bridge/check.txt
 bridge/venv/

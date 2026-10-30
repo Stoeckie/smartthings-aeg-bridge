@@ -3,17 +3,22 @@
 Sources
   * AEG / Electrolux appliances (dryer, washer-dryer) via the official Electrolux Group Developer API
     (developer.electrolux.one): state at start, live updates over SSE, poll as fallback.
+  * Fujitsu air conditioners with an FGLair wifi adapter, via the Ayla cloud that the FGLair app uses
+    (library ayla-iot-unofficial, the same one Home Assistant uses). Polled every 60 s.
 
 Credentials live only in config.json next to this script (never in the code).
 
 LAN API (default port 8787, no auth, LAN only)
   GET  /stbridge/info                    -> {"service": "stoeckie-bridge", "id": ..., "version": ...}
   GET  /stbridge/devices                 -> {"devices": [ {id, type, name, online, state{...}} ]}
-  POST /stbridge/devices/<id>/command    body {"cmd": "open|close|stop|level|refresh", "value": n}
+  POST /stbridge/devices/<id>/command    body {"cmd": "...", "value": ...}
+      dryer:   run | pause | resume | stop | refresh
+      aircon:  on | off | mode (auto cool dry fan heat) | setpoint (C) | fan (quiet low medium high auto)
+               | swing (off vertical horizontal both) | refresh
 
 Usage
   python stoeckie_bridge.py           run the bridge
-  python stoeckie_bridge.py --check   test the AEG login and list appliances
+  python stoeckie_bridge.py --check   test the AEG and FGLair logins and list appliances
   python stoeckie_bridge.py --demo    fake devices, to test the Edge driver
 """
 from __future__ import annotations
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import html
 import ipaddress
 import json
 import os
@@ -35,7 +41,7 @@ from typing import Any
 
 from aiohttp import web
 
-VERSION = "2026-10-30a"
+VERSION = "2026-10-30b"
 HERE = Path(__file__).resolve().parent
 # Data folder: next to the script on Windows, /data in the Docker image (STBRIDGE_DATA)
 DATA = Path(os.environ.get("STBRIDGE_DATA") or HERE)
@@ -233,21 +239,202 @@ class Electrolux:
         await self.client.start_event_stream(do_on_livestream_opening_list=[resync])
 
 
+# ---------------------------------------------------------------- Fujitsu FGLair (Ayla cloud)
+
+def fglair_configured(f: dict[str, Any]) -> bool:
+    return bool(f.get("username") and f.get("password") and not str(f.get("password")).startswith("PLAK_HIER"))
+
+
+def _name(e) -> str:
+    return getattr(e, "name", str(e)).lower()
+
+
+SWING_NAMES = {"OFF": "off", "SWING_VERTICAL": "vertical", "SWING_HORIZONTAL": "horizontal", "SWING_BOTH": "both"}
+
+
+def aircon_state(dev) -> dict[str, Any]:
+    """Flatten a FujitsuHVAC object into what the Edge driver needs."""
+    def safe(fn, default=None):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001  (missing property on this model)
+            return default
+    mode = safe(lambda: _name(dev.op_mode), "off")
+    lo, hi = safe(lambda: dev.temperature_range, (16.0, 30.0)) if mode not in ("off", "on") else (16.0, 30.0)
+    return {
+        "power": "off" if mode == "off" else "on",
+        "mode": mode,                                   # off on auto cool dry fan heat
+        "setpoint": safe(lambda: dev.set_temp),
+        "temperature": safe(lambda: dev.sensed_temp),   # None on models without a room sensor
+        "outdoorTemperature": safe(lambda: dev.outdoor_temperature),
+        "fan": safe(lambda: _name(dev.fan_speed)),
+        "swing": safe(lambda: SWING_NAMES.get(dev.swing_mode.name, "off"), "off"),
+        "supportedModes": [m for m in (_name(x) for x in safe(lambda: dev.supported_op_modes, []))
+                           if m not in ("off", "on")],
+        "supportedFans": [_name(x) for x in safe(lambda: dev.supported_fan_speeds, [])],
+        "supportedSwings": [SWING_NAMES.get(x.name, "off") for x in safe(lambda: dev.supported_swing_modes, [])],
+        "setpointRange": [lo, hi],
+        "model": getattr(dev, "oem_model_number", None),
+    }
+
+
+class FGLair:
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.f = cfg.get("fglair") or {}
+        self.api = None
+        self.devices: dict[str, Any] = {}  # dsn -> FujitsuHVAC
+        self.skipped: set[str] = set()
+        self.lock = asyncio.Lock()
+
+    def _new_api(self, session):
+        from ayla_iot_unofficial import new_ayla_api
+        from ayla_iot_unofficial.fujitsu_consts import FGLAIR_APP_CREDENTIALS
+        region = str(self.f.get("region") or "eu").lower()
+        app_id, app_secret = FGLAIR_APP_CREDENTIALS.get(region, FGLAIR_APP_CREDENTIALS["default"])
+        return new_ayla_api(self.f["username"], self.f["password"], app_id, app_secret,
+                            websession=session, europe=(region == "eu"))
+
+    async def _auth(self) -> None:
+        from ayla_iot_unofficial.exc import AylaAuthExpiringError
+        try:
+            self.api.check_auth()
+            return
+        except AylaAuthExpiringError:
+            try:
+                await self.api.async_refresh_auth()
+                return
+            except Exception as ex:  # noqa: BLE001
+                log.info("[fglair] token refresh failed (%s), signing in again", ex)
+        except Exception:  # noqa: BLE001  (not signed in or expired)
+            pass
+        await self.api.async_sign_in()
+
+    def _publish(self, dsn: str) -> None:
+        dev = self.devices[dsn]
+        try:
+            name = dev.device_name or dev.name
+        except Exception:  # noqa: BLE001
+            name = getattr(dev, "name", None) or "Airco"
+        REG.upsert("fglair-" + dsn, "aircon", name, aircon_state(dev), dev.is_online(), self._command(dsn))
+
+    async def _refresh(self, dsn: str) -> None:
+        dev = self.devices[dsn]
+        if dev.is_online():
+            await dev.async_update()
+        self._publish(dsn)
+
+    async def _sync(self) -> None:
+        """List devices (online state), then read every unit."""
+        from ayla_iot_unofficial.fujitsu_hvac import FujitsuHVAC
+        async with self.lock:
+            await self._auth()
+            listed = await self.api.async_get_devices()
+            for d in listed:
+                dsn = d.serial_number
+                if not isinstance(d, FujitsuHVAC):
+                    if dsn not in self.skipped:
+                        self.skipped.add(dsn)
+                        log.warning("[fglair] device %s '%s' model %s not supported by ayla-iot-unofficial",
+                                    dsn, d.name, getattr(d, "oem_model_number", "?"))
+                    continue
+                if dsn in self.devices:
+                    self.devices[dsn]._connection_status = d._connection_status
+                else:
+                    log.info("[fglair] unit %s '%s' model %s", dsn, d.name, d.oem_model_number)
+                    self.devices[dsn] = d
+                try:
+                    await self._refresh(dsn)
+                except Exception as ex:  # noqa: BLE001
+                    log.warning("[fglair] update %s failed: %s", dsn, ex)
+                    REG.set_online("fglair-" + dsn, False)
+
+    def _command(self, dsn: str):
+        async def handler(cmd: str, value: Any) -> None:
+            from ayla_iot_unofficial.fujitsu_consts import FanSpeed, OpMode
+            dev = self.devices[dsn]
+            async with self.lock:
+                await self._auth()
+                if cmd == "refresh":
+                    pass
+                elif cmd == "on":
+                    await dev.async_set_op_mode(OpMode.ON)
+                elif cmd == "off":
+                    await dev.async_set_op_mode(OpMode.OFF)
+                elif cmd == "mode":
+                    await dev.async_set_op_mode(OpMode[str(value).upper()])
+                elif cmd == "setpoint":
+                    await dev.async_set_set_temp(float(value))
+                elif cmd == "fan":
+                    await dev.async_set_fan_speed(FanSpeed[str(value).upper()])
+                elif cmd == "swing":
+                    # set each axis the unit has (the library also touches axes the unit lacks)
+                    from ayla_iot_unofficial.fujitsu_consts import Capability
+                    want = str(value).lower()
+                    if want not in ("off", "vertical", "horizontal", "both"):
+                        raise ValueError(f"unsupported swing {value}")
+                    if dev.has_capability(Capability.SWING_VERTICAL):
+                        await dev.async_set_vertical_swing(want in ("vertical", "both"))
+                    if dev.has_capability(Capability.SWING_HORIZONTAL):
+                        await dev.async_set_horizontal_swing(want in ("horizontal", "both"))
+                else:
+                    raise ValueError(f"unsupported command {cmd}")
+                log.info("[fglair] %s %s %s", dsn, cmd, "" if value is None else value)
+                if cmd != "refresh":
+                    await asyncio.sleep(2)  # the cloud needs a moment before the unit reports back
+                await self._refresh(dsn)
+        return handler
+
+    async def run(self) -> None:
+        if not fglair_configured(self.f):
+            log.info("[fglair] not configured")
+            return
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            self.api = self._new_api(session)
+            while True:
+                try:
+                    await self.api.async_sign_in()
+                    break
+                except Exception as ex:  # noqa: BLE001
+                    log.error("[fglair] login failed: %s (retry in 5 min)", ex)
+                    await asyncio.sleep(300)
+            log.info("[fglair] logged in")
+            while True:
+                try:
+                    await self._sync()
+                except Exception as ex:  # noqa: BLE001
+                    log.warning("[fglair] poll failed: %s", ex)
+                    REG.set_online("fglair-", False)
+                await asyncio.sleep(int(self.f.get("poll_seconds", 60)))
+
+
 # ---------------------------------------------------------------- LAN HTTP API
 
 SETUP_HTML = """<!doctype html><html lang="nl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Stoeckie Bridge setup</title>
 <style>body{font:15px system-ui,sans-serif;max-width:640px;margin:32px auto;padding:0 16px;color:#222}
-label{display:block;margin:14px 0 4px;font-weight:600}input,textarea{width:100%;box-sizing:border-box;padding:8px;
+label{display:block;margin:14px 0 4px;font-weight:600}input,textarea,select{width:100%;box-sizing:border-box;padding:8px;
 font:13px ui-monospace,monospace}textarea{height:90px}button{margin-top:18px;padding:10px 18px;font-size:15px}
-.st{padding:10px;border-radius:6px;background:#f2f2f2;margin:12px 0}</style></head><body>
+.st{padding:10px;border-radius:6px;background:#f2f2f2;margin:12px 0}h3{margin-top:36px}</style></head><body>
 <h2>Stoeckie Bridge</h2><div class="st">{status}</div>
+<p>Alles wat je hier invult wordt alleen lokaal in config.json op deze pc opgeslagen.</p>
+<h3>AEG / Electrolux</h3>
 <p>Maak op <b>developer.electrolux.one</b> (inloggen met je AEG account) een API key aan en genereer
-een access token en refresh token. Plak ze hieronder. Ze worden alleen lokaal in config.json opgeslagen.</p>
-<form method="post"><label>API key</label><input name="api_key" autocomplete="off" required>
+een access token en refresh token.</p>
+<form method="post"><input type="hidden" name="section" value="aeg">
+<label>API key</label><input name="api_key" autocomplete="off" required>
 <label>Access token</label><textarea name="access_token" required></textarea>
 <label>Refresh token</label><textarea name="refresh_token" required></textarea>
-<button type="submit">Opslaan en verbinden</button></form></body></html>"""
+<button type="submit">AEG opslaan en verbinden</button></form>
+<h3>Fujitsu airco (FGLair)</h3>
+<p>E-mail en wachtwoord van de FGLair app.</p>
+<form method="post"><input type="hidden" name="section" value="fglair">
+<label>E-mail</label><input name="username" type="email" autocomplete="off" required>
+<label>Wachtwoord</label><input name="password" type="password" autocomplete="off" required>
+<label>Regio</label><select name="region"><option value="eu">Europa</option><option value="default">Overig</option>
+<option value="cn">China</option></select>
+<button type="submit">FGLair opslaan en verbinden</button></form></body></html>"""
 
 
 def make_app(bridge_id: str, on_setup=None) -> web.Application:
@@ -263,13 +450,25 @@ def make_app(bridge_id: str, on_setup=None) -> web.Application:
         return any(ip in net for net in SETUP_ALLOW)
 
     def status_text() -> str:
-        e = load_config().get("electrolux") or {}
+        cfg = load_config()
+        e, f = cfg.get("electrolux") or {}, cfg.get("fglair") or {}
+        lines = []
         devs = [d for d in REG.devices.values() if d["type"] == "dryer"]
         if not aeg_configured(e):
-            return "AEG: nog niet ingesteld."
-        if devs:
-            return "AEG verbonden: " + ", ".join(f"{d['name']} ({d['state'].get('applianceState')})" for d in devs)
-        return "AEG ingesteld, nog geen droger gevonden (zie bridge.log)."
+            lines.append("AEG: nog niet ingesteld.")
+        elif devs:
+            lines.append("AEG verbonden: " + ", ".join(f"{d['name']} ({d['state'].get('applianceState')})" for d in devs))
+        else:
+            lines.append("AEG ingesteld, nog geen droger gevonden (zie bridge.log).")
+        acs = [d for d in REG.devices.values() if d["type"] == "aircon"]
+        if not fglair_configured(f):
+            lines.append("FGLair: nog niet ingesteld.")
+        elif acs:
+            lines.append("FGLair verbonden: " + ", ".join(
+                f"{d['name']} ({d['state'].get('mode')}, {d['state'].get('setpoint')} C)" for d in acs))
+        else:
+            lines.append("FGLair ingesteld, nog geen airco gevonden (zie bridge.log).")
+        return "<br>".join(html.escape(x) for x in lines)
 
     async def setup_get(req):
         if not local_only(req):
@@ -281,13 +480,22 @@ def make_app(bridge_id: str, on_setup=None) -> web.Application:
             return web.Response(status=403, text="setup alleen op deze pc (localhost)")
         form = await req.post()
         cfg = load_config()
-        e = cfg.setdefault("electrolux", {})
-        for k in ("api_key", "access_token", "refresh_token"):
-            e[k] = "".join(str(form.get(k, "")).split())
-        save_config(cfg)
-        log.info("[setup] AEG credentials saved")
+        section = str(form.get("section", "aeg"))
+        if section == "fglair":
+            f = cfg.setdefault("fglair", {})
+            f["username"] = str(form.get("username", "")).strip()
+            f["password"] = str(form.get("password", ""))
+            f["region"] = str(form.get("region", "eu"))
+            save_config(cfg)
+            log.info("[setup] FGLair login saved")
+        else:
+            e = cfg.setdefault("electrolux", {})
+            for k in ("api_key", "access_token", "refresh_token"):
+                e[k] = "".join(str(form.get(k, "")).split())
+            save_config(cfg)
+            log.info("[setup] AEG credentials saved")
         if on_setup:
-            on_setup()
+            on_setup(section)
         await asyncio.sleep(4)
         raise web.HTTPFound("/setup")
 
@@ -338,8 +546,28 @@ async def demo_devices() -> None:
     async def dry(cmd, value):
         pass
 
+    ac = {"power": "on", "mode": "heat", "setpoint": 21.0, "temperature": 19.5, "outdoorTemperature": 8.0,
+          "fan": "auto", "swing": "off", "supportedModes": ["auto", "cool", "dry", "fan", "heat"],
+          "supportedFans": ["quiet", "low", "medium", "high", "auto"],
+          "supportedSwings": ["off", "vertical"], "setpointRange": [16.0, 30.0], "model": "DEMO"}
+
+    async def aircon(cmd, value):
+        if cmd == "on":
+            ac["power"] = "on"
+            ac["mode"] = ac.get("last_mode", "heat")
+        elif cmd == "off":
+            ac["last_mode"], ac["power"], ac["mode"] = ac["mode"], "off", "off"
+        elif cmd == "mode":
+            ac["power"], ac["mode"] = "on", str(value)
+        elif cmd == "setpoint":
+            ac["setpoint"] = float(value)
+        elif cmd in ("fan", "swing"):
+            ac[cmd] = str(value)
+        REG.upsert("demo-aircon", "aircon", "Demo airco", ac, True, aircon)
+
     await win("refresh", None)
     REG.handlers["demo-window"] = win
+    await aircon("refresh", None)
     t0 = time.time()
     while True:
         el = int(time.time() - t0) % 180
@@ -359,6 +587,13 @@ def seed_from_env(cfg: dict[str, Any]) -> None:
         cfg.setdefault("electrolux", {}).update(env)
         save_config(cfg)
         log.info("[setup] AEG credentials taken from environment")
+    f = cfg.get("fglair") or {}
+    user, pw = os.environ.get("FGLAIR_USERNAME"), os.environ.get("FGLAIR_PASSWORD")
+    if user and pw and not fglair_configured(f):
+        cfg.setdefault("fglair", {}).update({"username": user, "password": pw,
+                                             "region": os.environ.get("FGLAIR_REGION", "eu")})
+        save_config(cfg)
+        log.info("[setup] FGLair login taken from environment")
 
 
 async def serve(args) -> None:
@@ -369,16 +604,20 @@ async def serve(args) -> None:
         bridge_id = cfg["bridge_id"] = uuid.uuid4().hex[:12]
         save_config(cfg)
     port = int(cfg.get("port", 8787))
-    aeg_task: dict[str, asyncio.Task | None] = {"t": None}
+    sources = {"aeg": Electrolux, "fglair": FGLair}
+    tasks: dict[str, asyncio.Task] = {}
 
-    def start_aeg() -> None:
-        if aeg_task["t"]:
-            aeg_task["t"].cancel()
-        for dev_id in [d for d in REG.devices if d.startswith("aeg-")]:
+    def start(section: str) -> None:
+        if section not in sources:
+            return
+        if tasks.get(section):
+            tasks[section].cancel()
+        for dev_id in [d for d in REG.devices if d.startswith(section + "-")]:
             REG.devices.pop(dev_id, None)
-        aeg_task["t"] = asyncio.create_task(guarded("aeg", Electrolux(load_config()).run))
+            REG.handlers.pop(dev_id, None)
+        tasks[section] = asyncio.create_task(guarded(section, sources[section](load_config()).run))
 
-    runner = web.AppRunner(make_app(bridge_id, None if args.demo else start_aeg), access_log=None)
+    runner = web.AppRunner(make_app(bridge_id, None if args.demo else start), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log.info("Stoeckie Bridge %s listening on port %d (id %s)", VERSION, port, bridge_id)
@@ -397,17 +636,47 @@ async def serve(args) -> None:
     if args.demo:
         asyncio.create_task(demo_devices())
     else:
-        start_aeg()
+        for section in sources:
+            start(section)
     await asyncio.Event().wait()
 
 
 # ---------------------------------------------------------------- CLI
 
+async def check_fglair() -> None:
+    """Quick test of the FGLair login in config.json."""
+    cfg = load_config()
+    if not fglair_configured(cfg.get("fglair") or {}):
+        print("FGLair: nog niet ingesteld.")
+        return
+    import aiohttp
+    fg = FGLair(cfg)
+    async with aiohttp.ClientSession() as session:
+        fg.api = fg._new_api(session)
+        await fg.api.async_sign_in()
+        await fg._sync()
+    print(f"FGLair OK, {len(fg.devices)} airco('s):")
+    for d in REG.devices.values():
+        if d["type"] == "aircon":
+            s = d["state"]
+            print(f"  {d['name']} model={s.get('model')} online={d['online']} stand={s.get('mode')} "
+                  f"setpoint={s.get('setpoint')} binnen={s.get('temperature')} buiten={s.get('outdoorTemperature')} "
+                  f"fan={s.get('fan')} modes={s.get('supportedModes')}")
+
+
+async def check_all() -> None:
+    for name, fn in (("AEG", check_aeg), ("FGLair", check_fglair)):
+        try:
+            await fn()
+        except Exception as ex:  # noqa: BLE001
+            print(f"{name} FOUT: {ex}")
+
+
 async def check_aeg() -> None:
     """Quick test of the Electrolux credentials in config.json."""
     e = (load_config().get("electrolux") or {})
     if not aeg_configured(e):
-        print("Nog geen AEG gegevens. Open http://localhost:8787/setup op deze pc.")
+        print("AEG: nog niet ingesteld.")
         return
     from electrolux_group_developer_sdk.auth.token_manager import TokenManager
     from electrolux_group_developer_sdk.client.appliance_client import ApplianceClient
@@ -416,7 +685,7 @@ async def check_aeg() -> None:
     tm = TokenManager(e["access_token"], e["refresh_token"], e["api_key"], on_token_update=holder._on_tokens)
     client = ApplianceClient(tm, external_user_agent=f"StoeckieBridge/{VERSION}")
     apps = await client.get_appliances()
-    print(f"OK, {len(apps)} apparaat/apparaten:")
+    print(f"AEG OK, {len(apps)} apparaat/apparaten:")
     for a in apps:
         st = await client.get_appliance_state(a.applianceId)
         rep = (st.properties or {}).get("reported", {}) or {}
@@ -443,13 +712,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Stoeckie Bridge")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--demo", action="store_true", help="fake devices, for testing the driver")
-    p.add_argument("--check", action="store_true", help="test the AEG login, list appliances and exit")
+    p.add_argument("--check", action="store_true", help="test the AEG and FGLair logins, list appliances and exit")
     args = p.parse_args()
     setup_logging(args.verbose)
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     if args.check:
-        asyncio.run(check_aeg())
+        asyncio.run(check_all())
     else:
         asyncio.run(serve(args))
 
