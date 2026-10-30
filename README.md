@@ -2,7 +2,7 @@
 
 Get an **AEG or Electrolux tumble dryer** (and washer-dryer) into SmartThings with status, remaining time, door and a "cycle finished" state you can use for notifications. Uses the **official Electrolux Group Developer API**.
 
-Also: **Fujitsu air conditioners with an FGLair wifi adapter** (power, mode, setpoint, fan, swing, room and outdoor temperature) through the cloud the FGLair app uses.
+Also: **Fujitsu air conditioners with an FGLair wifi adapter** (power, mode, setpoint, fan, swing, room and outdoor temperature) through the cloud the FGLair app uses. Details: [smartthings-fujitsu-fglair](https://github.com/Stoeckie/smartthings-fujitsu-fglair) (same bridge and driver; one bridge serves both).
 
 Both are cloud only, and SmartThings Edge drivers can not reach the internet. So there are two parts:
 
