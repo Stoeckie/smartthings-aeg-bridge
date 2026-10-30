@@ -85,6 +85,10 @@ python -m pytest bridge/tests driver/tests
 
 The FGLair test runs against a fake Ayla cloud; the driver test runs `driver/src/init.lua` with a mocked SmartThings runtime against the bridge in `--demo` mode.
 
+## iRobot favorites (optional)
+
+With the [iRobot Roomba (local)](https://github.com/Stoeckie/smartthings-irobot-roomba-local) Edge driver, the bridge can read the names and rooms of your iRobot app favorites, so they show up in SmartThings without setup. Enter the e-mail and password of the iRobot app in the **iRobot** section of the setup page. The bridge only reads the favorites (twice a day, or when you press Refresh on the robot); the robot itself is controlled locally by the hub. Uses [roombapy-prime](https://github.com/johnnyh1975/roombapy-prime), an unofficial client: iRobot limits the number of logins per account.
+
 ## Siemens / Bosch?
 
 Not needed: Home Connect appliances have an official SmartThings integration (Add device → Home Connect).
