@@ -2,7 +2,7 @@
 
 Get an **AEG or Electrolux tumble dryer** (and washer-dryer) into SmartThings with status, remaining time, door and a "cycle finished" state you can use for notifications. Uses the **official Electrolux Group Developer API**.
 
-The code lives in **[Stoeckie/smartthings-stoeckie-bridge](https://github.com/Stoeckie/smartthings-stoeckie-bridge)**: one small bridge (Windows or Docker) plus the Edge driver **Stoeckie Bridge (local)**. The same bridge also does Fujitsu FGLair air conditioners, Škoda cars, the VELUX ACTIVE departure mode and a rain radar (Buienradar in NL/BE, Open-Meteo worldwide); you only set up what you have.
+The code lives in **[Stoeckie/smartthings-stoeckie-bridge](https://github.com/Stoeckie/smartthings-stoeckie-bridge)**: one small bridge (Windows or Docker) plus the Edge driver **Stoeckie Bridge (local)**. The same bridge also does Fujitsu FGLair air conditioners, Škoda cars, the VELUX ACTIVE departure mode and a rain radar (Buienradar in NL/BE, Open-Meteo worldwide); you only set up what you have. The Stoeckie Bridge device has a Connection status (Connected or Offline), so a routine can notify you when the bridge goes offline.
 
 ## What you get
 
